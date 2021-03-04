@@ -37,7 +37,6 @@ private:
 	ros::Publisher point_cloud_publisher_;
 	ros::Publisher laser_scan_publisher_;
 	vector<ros::Subscriber> scan_subscribers;
-	vector<bool> clouds_modified;
 
 	vector<pcl::PCLPointCloud2> clouds;
 	vector<string> input_topics;
@@ -84,22 +83,21 @@ void LaserscanMerger::laserscan_topic_parser()
 	sort(tokens.begin(), tokens.end());
 	std::vector<string>::iterator last = std::unique(tokens.begin(), tokens.end());
 	tokens.erase(last, tokens.end());
+	input_topics = tokens;
 
 	// Unsubscribe from previous topics
 	for (int i = 0; i < scan_subscribers.size(); ++i)
 		scan_subscribers[i].shutdown();
 
-	if (tokens.size() > 0)
+	if (input_topics.size() > 0)
 	{
-		scan_subscribers.resize(tokens.size());
-		clouds_modified.resize(tokens.size());
-		clouds.resize(tokens.size());
+		scan_subscribers.resize(input_topics.size());
+		clouds.resize(input_topics.size());
 		ROS_INFO("Subscribing to topics:\t%ld", scan_subscribers.size());
-		for (int i = 0; i < tokens.size(); ++i)
+		for (int i = 0; i < input_topics.size(); ++i)
 		{
-			scan_subscribers[i] = node_.subscribe<sensor_msgs::LaserScan>(tokens[i], 1, boost::bind(&LaserscanMerger::scanCallback, this, _1, tokens[i]));
-			clouds_modified[i] = false;
-			cout << tokens[i] << " ";
+			scan_subscribers[i] = node_.subscribe<sensor_msgs::LaserScan>(input_topics[i], 1, boost::bind(&LaserscanMerger::scanCallback, this, _1, input_topics[i]));
+			cout << input_topics[i] << " ";
 		}
 		cout << "\n";
 	}
@@ -155,26 +153,18 @@ void LaserscanMerger::scanCallback(const sensor_msgs::LaserScan::ConstPtr &scan,
 		{
 			sensor_msgs::convertPointCloudToPointCloud2(tmpCloud2, tmpCloud3);
 			pcl_conversions::toPCL(tmpCloud3, clouds[i]);
-			clouds_modified[i] = true;
 		}
 	}
 
-	// Count how many scans we have
-	int totalClouds = 0;
-	for (int i = 0; i < clouds_modified.size(); ++i)
-		if (clouds_modified[i])
-			++totalClouds;
-
-	// Go ahead only if all subscribed scans have arrived
-	if (totalClouds == clouds_modified.size())
+	int first_non_empty = std::distance(clouds.begin(), find_if(clouds.begin(), clouds.end(), [](const pcl::PCLPointCloud2& x){return !x.data.empty();}));
+	if(first_non_empty < clouds.size())
 	{
-		pcl::PCLPointCloud2 merged_cloud = clouds[0];
-		clouds_modified[0] = false;
+		pcl::PCLPointCloud2 merged_cloud = clouds[first_non_empty];
 
-		for (int i = 1; i < clouds_modified.size(); ++i)
+		for (int i = first_non_empty + 1; i < clouds.size(); ++i)
 		{
-			pcl::concatenatePointCloud(merged_cloud, clouds[i], merged_cloud);
-			clouds_modified[i] = false;
+			if(!clouds[i].data.empty())
+				pcl::concatenatePointCloud(merged_cloud, clouds[i], merged_cloud);
 		}
 
 		if(publish_pointcloud)
