@@ -26,11 +26,13 @@ class LaserscanMerger
 public:
 	LaserscanMerger();
 	void scanCallback(const sensor_msgs::LaserScan::ConstPtr &scan, std::string topic);
+	void timerCallback(const ros::TimerEvent &);
 	void pointcloud_to_laserscan(Eigen::MatrixXf points, pcl::PCLPointCloud2 *merged_cloud);
 	void reconfigureCallback(laserscan_multi_mergerConfig &config, uint32_t level);
 
 private:
 	ros::NodeHandle node_;
+	ros::Timer timer;
 	laser_geometry::LaserProjection projector_;
 	tf::TransformListener tfListener_;
 
@@ -40,8 +42,11 @@ private:
 
 	vector<pcl::PCLPointCloud2> clouds;
 	vector<string> input_topics;
+	vector<string> unsubscribed_topics;
 
 	void laserscan_topic_parser();
+	bool subscribeTopic(const std::string &topic, std::vector<ros::Subscriber> &subscribers);
+	void subscribeAllTopics(std::vector<std::string> &topics);
 
 	double angle_min;
 	double angle_max;
@@ -69,38 +74,74 @@ void LaserscanMerger::reconfigureCallback(laserscan_multi_mergerConfig &config, 
 	this->range_max = config.range_max;
 }
 
-void LaserscanMerger::laserscan_topic_parser()
+bool LaserscanMerger::subscribeTopic(const std::string &topic, std::vector<ros::Subscriber> &subscribers)
 {
-	// LaserScan topics to subscribe
+	//Get available topics from ROS master
 	ros::master::V_TopicInfo topics;
 	ros::master::getTopics(topics);
 
+	//Check if topic to be subscribed exists in list of ros master topics
+	auto it = std::find_if(topics.begin(), topics.end(), [&](const ros::master::TopicInfo &t) {
+		return t.name.compare(topic) == 0 && t.datatype.compare("sensor_msgs/LaserScan") == 0;
+	});
+
+	//Subscribe, matching topic found
+	if (it != topics.end())
+	{
+		subscribers.push_back(node_.subscribe<sensor_msgs::LaserScan>(topic, 1, boost::bind(&LaserscanMerger::scanCallback, this, _1, topic)));
+		return true;
+	}
+
+	else
+		return false;
+}
+
+void LaserscanMerger::subscribeAllTopics(std::vector<std::string> &topics)
+{
+	for (int i = 0; i < topics.size(); ++i)
+	{
+		if (subscribeTopic(topics[i], scan_subscribers))
+		{
+			ROS_INFO("Laser Scan Merger subscribed to %s", topics[i].c_str());
+
+			//Add topic to list of subscribed topics
+			input_topics.push_back(topics[i]);
+
+			//Remove the topic from unsubscribed topics on successful subscription
+			topics.erase(topics.begin() + i);
+			--i;
+		}
+	}
+
+	//Resize cloud to fit all subscribed topics
+	clouds.resize(scan_subscribers.size());
+}
+
+void LaserscanMerger::timerCallback(const ros::TimerEvent &)
+{
+	subscribeAllTopics(unsubscribed_topics);
+	if (unsubscribed_topics.empty())
+		timer.stop();
+}
+
+void LaserscanMerger::laserscan_topic_parser()
+{
 	istringstream iss(laserscan_topics);
-	vector<string> tokens;
-	copy(istream_iterator<string>(iss), istream_iterator<string>(), back_inserter<vector<string>>(tokens));
+	copy(istream_iterator<string>(iss), istream_iterator<string>(), back_inserter<vector<string>>(unsubscribed_topics));
 
 	//Remove duplicate topics from param file if any
-	sort(tokens.begin(), tokens.end());
-	std::vector<string>::iterator last = std::unique(tokens.begin(), tokens.end());
-	tokens.erase(last, tokens.end());
-	input_topics = tokens;
+	sort(unsubscribed_topics.begin(), unsubscribed_topics.end());
+	auto last = std::unique(unsubscribed_topics.begin(), unsubscribed_topics.end());
+	unsubscribed_topics.erase(last, unsubscribed_topics.end());
 
 	// Unsubscribe from previous topics
 	for (int i = 0; i < scan_subscribers.size(); ++i)
 		scan_subscribers[i].shutdown();
 
-	if (input_topics.size() > 0)
-	{
-		scan_subscribers.resize(input_topics.size());
-		clouds.resize(input_topics.size());
-		ROS_INFO("Subscribing to topics:\t%ld", scan_subscribers.size());
-		for (int i = 0; i < input_topics.size(); ++i)
-		{
-			scan_subscribers[i] = node_.subscribe<sensor_msgs::LaserScan>(input_topics[i], 1, boost::bind(&LaserscanMerger::scanCallback, this, _1, input_topics[i]));
-			cout << input_topics[i] << " ";
-		}
-		cout << "\n";
-	}
+	// Subscribe to topics if they exist, else store in queue to try again later
+	if (!unsubscribed_topics.empty())
+		subscribeAllTopics(unsubscribed_topics);
+
 	else
 		ROS_INFO("Not subscribed to any topic.");
 }
@@ -123,7 +164,11 @@ LaserscanMerger::LaserscanMerger()
 
 	this->laserscan_topic_parser();
 
-	if(publish_pointcloud)
+	//Create timer event to attempt susbcribing topics if some were left unsubscribed
+	if (!unsubscribed_topics.empty())
+		timer = node_.createTimer(ros::Duration(0.1), &LaserscanMerger::timerCallback, this);
+
+	if (publish_pointcloud)
 		point_cloud_publisher_ = node_.advertise<sensor_msgs::PointCloud2>(cloud_destination_topic.c_str(), 1, false);
 
 	laser_scan_publisher_ = node_.advertise<sensor_msgs::LaserScan>(scan_destination_topic.c_str(), 1, false);
@@ -147,6 +192,7 @@ void LaserscanMerger::scanCallback(const sensor_msgs::LaserScan::ConstPtr &scan,
 		return;
 	}
 
+	//Fill cloud to respective index location
 	for (int i = 0; i < input_topics.size(); ++i)
 	{
 		if (topic.compare(input_topics[i]) == 0)
@@ -156,18 +202,26 @@ void LaserscanMerger::scanCallback(const sensor_msgs::LaserScan::ConstPtr &scan,
 		}
 	}
 
-	int first_non_empty = std::distance(clouds.begin(), find_if(clouds.begin(), clouds.end(), [](const pcl::PCLPointCloud2& x){return !x.data.empty();}));
-	if(first_non_empty < clouds.size())
+	//Count number of valid scans
+	int valid_scans = 0;
+	for(const auto & cloud : clouds)
 	{
-		pcl::PCLPointCloud2 merged_cloud = clouds[first_non_empty];
+		if(cloud.header.frame_id != "")
+			valid_scans++;
+	}
 
-		for (int i = first_non_empty + 1; i < clouds.size(); ++i)
+	// int first_non_empty = std::distance(clouds.begin(), find_if(clouds.begin(), clouds.end(), [](const pcl::PCLPointCloud2 &x) { return !x.data.empty(); }));
+	// if (first_non_empty < clouds.size())
+	if(valid_scans == clouds.size())
+	{
+		pcl::PCLPointCloud2 merged_cloud = clouds[0];
+		for (int i = 1; i < clouds.size(); ++i)
 		{
-			if(!clouds[i].data.empty())
-				pcl::concatenatePointCloud(merged_cloud, clouds[i], merged_cloud);
+			pcl::concatenatePointCloud(merged_cloud, clouds[i], merged_cloud);
+			clouds[i].header.frame_id = "";
 		}
 
-		if(publish_pointcloud)
+		if (publish_pointcloud)
 			point_cloud_publisher_.publish(merged_cloud);
 
 		Eigen::MatrixXf points;
